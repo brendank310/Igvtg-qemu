@@ -2093,9 +2093,10 @@ static void select_vgahw(const char *p)
                 error_report("%s not available", ti->name);
                 exit(1);
             }
-            vga_interface_type = t;
-            break;
-        }
+	    vga_interface_type = t;
+	    printf("%s vga is %s\n", __func__, ti->opt_name);           
+	    break;
+	}
     }
     if (t == VGA_TYPE_MAX) {
     invalid_vga:
@@ -2115,6 +2116,7 @@ static void select_vgahw(const char *p)
         } else goto invalid_vga;
         opts = nextopt;
     }
+
 }
 
 static void parse_display_qapi(const char *optarg)
@@ -3957,6 +3959,24 @@ int main(int argc, char **argv, char **envp)
                 break;
             case QEMU_OPTION_nouserconfig:
                 /* Nothing to be parsed here. Especially, do not error out below. */
+		break;
+            case QEMU_OPTION_vgt_low_gm_sz:
+                {
+                    char *ptr;
+                    vgt_low_gm_sz = strtol(optarg, &ptr, 10);
+                }
+                break;
+            case QEMU_OPTION_vgt_high_gm_sz:
+                {
+                    char *ptr;
+                    vgt_high_gm_sz = strtol(optarg, &ptr, 10);
+                }
+                break;
+            case QEMU_OPTION_vgt_fence_sz:
+                {
+                    char *ptr;
+                    vgt_fence_sz = strtol(optarg, &ptr, 10);
+                }
                 break;
             default:
                 if (os_parse_cmd_args(popt->index, optarg)) {
