@@ -369,6 +369,14 @@ struct vfio_region_gfx_edid {
 #define VFIO_REGION_SUBTYPE_IBM_NVLINK2_ATSD	(1)
 
 /*
+ * The region type device state is for save or restore the vfio device during
+ * migration. 
+ */
+#define VFIO_REGION_TYPE_DEVICE_STATE		(1 << 30)
+/* Mdev sub-type for device state save and restore */
+#define VFIO_REGION_SUBTYPE_DEVICE_STATE	(1)
+
+/*
  * The MSIX mappable capability informs that MSIX data of a BAR can be mmapped
  * which allows direct access to non-MSIX registers which happened to be within
  * the same system page.
