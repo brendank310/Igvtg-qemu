@@ -40,6 +40,9 @@
 #include "hw/xen/xen.h"
 #include "hw/display/vga.h"
 
+#include <linux/vfio.h>
+#include <sys/ioctl.h>
+
 #define DEBUG_VGT
 
 #ifdef DEBUG_VGT
@@ -49,6 +52,23 @@
 #define DPRINTF(fmt, ...) \
     do { } while (0)
 #endif
+
+typedef struct XenGTDMABuf {
+    QemuDmaBuf buf;
+    uint32_t pos_x, pos_y, pos_updates;
+    uint32_t hot_x, hot_y, hot_updates;
+    int dmabuf_id;
+    QTAILQ_ENTRY(XenGTDMABuf) next;
+} XenGTDMABuf;
+
+typedef struct XenGTDisplay {
+    QemuConsole *con;
+    struct {
+        QTAILQ_HEAD(, VFIODMABuf) bufs;
+        XenGTDMABuf *primary;
+        XenGTDMABuf *cursor;
+    } dmabuf;
+} XenGTDisplay;
 
 typedef struct VGTHostDevice {
     PCIHostDeviceAddress addr;
@@ -67,6 +87,8 @@ typedef struct VGTVGAState {
     VGTHostDevice host_dev;
     bool instance_created;
     int domid;
+    int device_fd;
+    XenGTDisplay *dpy;
 } VGTVGAState;
 
 /* These are the default values */
@@ -79,7 +101,7 @@ int guest_domid = 0;
 static int vgt_host_pci_cfg_get(VGTHostDevice *host_dev,
                                 void *data, int len, uint32_t addr);
 static void cpu_update_state(void *pv, int running, RunState state);
- 
+
 
 void vgt_bridge_pci_write(PCIDevice *dev,
                           uint32_t address, uint32_t val, int len)
@@ -88,6 +110,46 @@ void vgt_bridge_pci_write(PCIDevice *dev,
 
     i440fx_write_config(dev, address, val, len);
 }
+
+static void display_dmabuf_update(void *opaque)
+{
+    VGTVGAState *vdev = opaque;
+    (void)vdev;
+}
+
+static const GraphicHwOps display_dmabuf_ops = {
+    .gfx_update = display_dmabuf_update,
+};
+
+static int display_dmabuf_init(VGTVGAState *vdev)
+{
+    if (!display_opengl) {
+        return -1;
+    }
+
+    vdev->dpy = g_new0(XenGTDisplay, 1);
+    vdev->dpy->con = graphic_console_init(DEVICE(vdev), 0,
+                                          &display_dmabuf_ops,
+                                          vdev);
+    return 0;
+}
+
+static int display_probe(VGTVGAState *vdev)
+{
+    struct vfio_device_gfx_plane_info probe;
+    int ret;
+
+    memset(&probe, 0, sizeof(probe));
+    probe.argsz = sizeof(probe);
+    probe.flags = VFIO_GFX_PLANE_TYPE_PROBE | VFIO_GFX_PLANE_TYPE_DMABUF;
+    ret = ioctl(vdev->device_fd, VFIO_DEVICE_QUERY_GFX_PLANE, &probe);
+    if (ret == 0) {
+        return display_dmabuf_init(vdev);
+    }
+
+    return -1;
+}
+
 
 /*
  *  Inform vGT driver to create a vGT instance
@@ -99,7 +161,7 @@ static void create_vgt_instance(VGTVGAState *vdev)
     FILE *vgt_file;
     int err = 0;
     int domid = vdev->domid;
-  
+
     qemu_log("vGT: %s: domid=%d, low_gm_sz=%dMB, high_gm_sz=%dMB, "
         "fence_sz=%d, vgt_primary=%d\n", __func__, domid,
         vgt_low_gm_sz, vgt_high_gm_sz, vgt_fence_sz, vgt_primary);
@@ -134,16 +196,36 @@ static void create_vgt_instance(VGTVGAState *vdev)
     }
 
     vdev->instance_created = TRUE;
+
+    char devpath[16];
+    int device_fd = -1;
+    memset(devpath, 0, 16);
+
+    snprintf(devpath, 16, "/dev/gvtg-%hi", vdev->domid);
+    device_fd = open(devpath, O_RDWR);
+    if (device_fd < 0) {
+        err = errno;
+        qemu_log("vGT: %s failed to open device: %s. errno=%d\n", __func__, devpath, err);
+        exit(-1);
+    }
+
+    vdev->device_fd = device_fd;
+    display_probe(vdev);
 }
 
 /*
  *  Inform vGT driver to close a vGT instance
  */
-static void destroy_vgt_instance(int domid)
+static void destroy_vgt_instance(VGTVGAState *vdev)
 {
     const char *path = "/sys/kernel/vgt/control/create_vgt_instance";
     FILE *vgt_file;
     int err = 0;
+
+    if(vdev->device_fd > 0) {
+        close(vdev->device_fd);
+        vdev->device_fd = -1;
+    }
 
     if ((vgt_file = fopen(path, "w")) == NULL) {
         error_report("vgt: error: open %s failed", path);
@@ -153,7 +235,7 @@ static void destroy_vgt_instance(int domid)
     /* -domid means we want the vgt driver to free the vgt instance
      * of Domain domid.
      * */
-    if (!err && fprintf(vgt_file, "%d\n", -domid) < 0) {
+    if (!err && fprintf(vgt_file, "%d\n", -vdev->domid) < 0) {
         err = errno;
     }
 
@@ -273,7 +355,7 @@ static void vgt_reset(DeviceState *dev)
     VGTVGAState *d = DO_UPCAST(VGTVGAState, dev, pdev);
 
     if (d->instance_created) {
-        destroy_vgt_instance(d->domid);
+        destroy_vgt_instance(d);
     }
 
     create_vgt_instance(d);
@@ -284,7 +366,7 @@ static void vgt_cleanupfn(PCIDevice *dev)
     VGTVGAState *d = DO_UPCAST(VGTVGAState, dev, dev);
 
     if (d->instance_created) {
-        destroy_vgt_instance(d->domid);
+        destroy_vgt_instance(d);
     }
 }
 
@@ -488,7 +570,7 @@ static int vgt_device_put(QEMUFile *f, void *pv, size_t size,
 
     read_write_state(f, d, true);
 
-    destroy_vgt_instance(d->domid);
+    destroy_vgt_instance(d);
     return 0;
 }
 
