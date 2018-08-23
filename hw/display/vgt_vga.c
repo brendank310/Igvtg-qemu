@@ -64,7 +64,7 @@ typedef struct XenGTDMABuf {
 typedef struct XenGTDisplay {
     QemuConsole *con;
     struct {
-        QTAILQ_HEAD(, VFIODMABuf) bufs;
+        QTAILQ_HEAD(, XenGTDMABuf) bufs;
         XenGTDMABuf *primary;
         XenGTDMABuf *cursor;
     } dmabuf;
@@ -111,10 +111,151 @@ void vgt_bridge_pci_write(PCIDevice *dev,
     i440fx_write_config(dev, address, val, len);
 }
 
+#ifndef DRM_PLANE_TYPE_PRIMARY
+# define DRM_PLANE_TYPE_PRIMARY 1
+# define DRM_PLANE_TYPE_CURSOR  2
+#endif
+
+static void display_update_cursor(XenGTDMABuf *dmabuf,
+                                  struct vfio_device_gfx_plane_info *plane)
+{
+    if (dmabuf->pos_x != plane->x_pos || dmabuf->pos_y != plane->y_pos) {
+        dmabuf->pos_x      = plane->x_pos;
+        dmabuf->pos_y      = plane->y_pos;
+        dmabuf->pos_updates++;
+    }
+    if (dmabuf->hot_x != plane->x_hot || dmabuf->hot_y != plane->y_hot) {
+        dmabuf->hot_x      = plane->x_hot;
+        dmabuf->hot_y      = plane->y_hot;
+        dmabuf->hot_updates++;
+    }
+}
+
+static XenGTDMABuf *display_get_dmabuf(VGTVGAState *vdev,
+                                       uint32_t plane_type)
+{
+    XenGTDisplay *dpy = vdev->dpy;
+    struct vfio_device_gfx_plane_info plane;
+    XenGTDMABuf *dmabuf;
+    int fd, ret;
+
+    memset(&plane, 0, sizeof(plane));
+    plane.argsz = sizeof(plane);
+    plane.flags = VFIO_GFX_PLANE_TYPE_DMABUF;
+    plane.drm_plane_type = plane_type;
+    ret = ioctl(vdev->device_fd, VFIO_DEVICE_QUERY_GFX_PLANE, &plane);
+    if (ret < 0) {
+        return NULL;
+    }
+    if (!plane.drm_format || !plane.size) {
+        return NULL;
+    }
+
+    QTAILQ_FOREACH(dmabuf, &dpy->dmabuf.bufs, next) {
+        if (dmabuf->dmabuf_id == plane.dmabuf_id) {
+            /* found in list, move to head, return it */
+            QTAILQ_REMOVE(&dpy->dmabuf.bufs, dmabuf, next);
+            QTAILQ_INSERT_HEAD(&dpy->dmabuf.bufs, dmabuf, next);
+            if (plane_type == DRM_PLANE_TYPE_CURSOR) {
+                display_update_cursor(dmabuf, &plane);
+            }
+            return dmabuf;
+        }
+    }
+
+    fd = ioctl(vdev->device_fd, VFIO_DEVICE_GET_GFX_DMABUF, &plane.dmabuf_id);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    dmabuf = g_new0(XenGTDMABuf, 1);
+    dmabuf->dmabuf_id  = plane.dmabuf_id;
+    dmabuf->buf.width  = plane.width;
+    dmabuf->buf.height = plane.height;
+    dmabuf->buf.stride = plane.stride;
+    dmabuf->buf.fourcc = plane.drm_format;
+    dmabuf->buf.fd     = fd;
+    if (plane_type == DRM_PLANE_TYPE_CURSOR) {
+        display_update_cursor(dmabuf, &plane);
+    }
+
+    QTAILQ_INSERT_HEAD(&dpy->dmabuf.bufs, dmabuf, next);
+    return dmabuf;
+}
+
+static void display_free_one_dmabuf(XenGTDisplay *dpy, XenGTDMABuf *dmabuf)
+{
+    QTAILQ_REMOVE(&dpy->dmabuf.bufs, dmabuf, next);
+    dpy_gl_release_dmabuf(dpy->con, &dmabuf->buf);
+    close(dmabuf->buf.fd);
+    g_free(dmabuf);
+}
+
+static void display_free_dmabufs(VGTVGAState *vdev)
+{
+    XenGTDisplay *dpy = vdev->dpy;
+    XenGTDMABuf *dmabuf, *tmp;
+    uint32_t keep = 5;
+
+    QTAILQ_FOREACH_SAFE(dmabuf, &dpy->dmabuf.bufs, next, tmp) {
+        if (keep > 0) {
+            keep--;
+            continue;
+        }
+        assert(dmabuf != dpy->dmabuf.primary);
+        display_free_one_dmabuf(dpy, dmabuf);
+    }
+}
+
 static void display_dmabuf_update(void *opaque)
 {
     VGTVGAState *vdev = opaque;
-    (void)vdev;
+    XenGTDisplay *dpy = vdev->dpy;
+    XenGTDMABuf *primary, *cursor;
+    bool free_bufs = false, new_cursor = false;;
+
+    primary = display_get_dmabuf(vdev, DRM_PLANE_TYPE_PRIMARY);
+    if (primary == NULL) {
+        return;
+    }
+
+    if (dpy->dmabuf.primary != primary) {
+        dpy->dmabuf.primary = primary;
+        qemu_console_resize(dpy->con,
+                            primary->buf.width, primary->buf.height);
+        dpy_gl_scanout_dmabuf(dpy->con, &primary->buf);
+        free_bufs = true;
+    }
+
+    cursor = display_get_dmabuf(vdev, DRM_PLANE_TYPE_CURSOR);
+    if (dpy->dmabuf.cursor != cursor) {
+        dpy->dmabuf.cursor = cursor;
+        new_cursor = true;
+        free_bufs = true;
+    }
+
+    if (cursor && (new_cursor || cursor->hot_updates)) {
+        bool have_hot = (cursor->hot_x != 0xffffffff &&
+                         cursor->hot_y != 0xffffffff);
+        dpy_gl_cursor_dmabuf(dpy->con, &cursor->buf, have_hot,
+                             cursor->hot_x, cursor->hot_y);
+        cursor->hot_updates = 0;
+    } else if (!cursor && new_cursor) {
+        dpy_gl_cursor_dmabuf(dpy->con, NULL, false, 0, 0);
+    }
+
+    if (cursor && cursor->pos_updates) {
+        dpy_gl_cursor_position(dpy->con,
+                               cursor->pos_x,
+                               cursor->pos_y);
+        cursor->pos_updates = 0;
+    }
+
+    dpy_gl_update(dpy->con, 0, 0, primary->buf.width, primary->buf.height);
+
+    if (free_bufs) {
+        display_free_dmabufs(vdev);
+    }
 }
 
 static const GraphicHwOps display_dmabuf_ops = {
